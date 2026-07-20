@@ -1,0 +1,3 @@
+/home/duan/Desktop/test_uart_7_20/uart_project/build/CMakeFiles/uart_test.dir
+/home/duan/Desktop/test_uart_7_20/uart_project/build/CMakeFiles/edit_cache.dir
+/home/duan/Desktop/test_uart_7_20/uart_project/build/CMakeFiles/rebuild_cache.dir

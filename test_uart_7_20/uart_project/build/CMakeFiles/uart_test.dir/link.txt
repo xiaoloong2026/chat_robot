@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/uart_test.dir/src/main.cpp.o CMakeFiles/uart_test.dir/src/uart.cpp.o CMakeFiles/uart_test.dir/src/parser.cpp.o -o uart_test  -lpthread 
