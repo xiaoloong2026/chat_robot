@@ -1,0 +1,27 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+// ============================================================================
+// UART 下行发送 (AI → MCU)
+// ============================================================================
+
+/// 设置 UART 文件描述符
+void uart_sender_set_fd(int fd);
+
+/// 发送原始字节
+void uart_send_raw(const std::vector<uint8_t>& data);
+
+/// 发送控制指令 (TYPE 0x12 JSON/UTF-8)
+void uart_send_control(const std::string& json);
+
+/// 发送每段音频对应文本 (TYPE 0x13 UTF-8)
+void uart_send_segment_text(const std::string& text);
+
+/// 兼容旧调用：等价于 uart_send_control()
+void uart_send_text(const std::string& text);
+
+/// 发送 MP3 音频帧 (TYPE 0x11)，按 1024 字节切片
+void uart_send_mp3(const std::vector<uint8_t>& mp3_data);
