@@ -1,0 +1,733 @@
+/**
+ * audio_pipeline — ASR → LLM → TTS 音频对话调度（交互式多轮对话）
+ *
+ * 构建：
+ *   mkdir build && cd build
+ *   cmake .. -DCMAKE_BUILD_TYPE=Release
+ *   make -j$(nproc)
+ *
+ * 运行：
+ *   ./audio_pipeline            # 交互式多轮
+ *   ./audio_pipeline "你好"     # 单发
+ */
+
+#include "asr_client.h"
+#include "config.h"
+#include "json_helper.h"
+#include "llm_client.h"
+#include "opus_accumulator.h"
+#include "parser.hpp"
+#include "ring_buffer.hpp"
+#include "tts_client.h"
+#include "uart.hpp"
+#include "uart_sender.h"
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
+
+// ============================================================================
+// 线程安全句子队列
+// ============================================================================
+
+class SentenceQueue {
+public:
+    void push(std::string sentence) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            queue_.push(std::move(sentence));
+        }
+        cv_.notify_one();
+    }
+
+    std::string pop() {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait(lk, [this] { return !queue_.empty() || closed_; });
+        if (queue_.empty()) return "";
+        auto s = std::move(queue_.front());
+        queue_.pop();
+        return s;
+    }
+
+    void close() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            closed_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    mutable std::mutex mtx_;
+    std::condition_variable cv_;
+    std::queue<std::string> queue_;
+    bool closed_ = false;
+};
+
+// ============================================================================
+// 句子切分器
+// ============================================================================
+
+class SentenceSplitter {
+public:
+    std::vector<std::string> feed(const std::string& delta) {
+        std::vector<std::string> sentences;
+        buf_ += delta;
+        while (true) {
+            size_t best_pos = std::string::npos;
+            int    best_len = 0;
+            for (const auto& d : delimiters_) {
+                auto pos = buf_.find(d);
+                if (pos != std::string::npos && pos < best_pos) {
+                    best_pos = pos; best_len = static_cast<int>(d.size());
+                }
+            }
+            if (comma_left_ > 0) {
+                auto pos = buf_.find(u8"，");
+                if (pos != std::string::npos && pos < best_pos) {
+                    best_pos = pos; best_len = 3;
+                }
+            }
+            auto nlpos = buf_.find("\n\n");
+            if (nlpos != std::string::npos && nlpos < best_pos) {
+                best_pos = nlpos; best_len = 2;
+            }
+            if (best_pos == std::string::npos) break;
+
+            std::string sentence = trim(buf_.substr(0, best_pos + best_len));
+            buf_.erase(0, best_pos + best_len);
+            if (sentence.size() >= min_sentence_len) {
+                if (comma_left_ > 0) --comma_left_;
+                sentences.push_back(std::move(sentence));
+            }
+        }
+        return sentences;
+    }
+
+    std::string flush() {
+        auto s = trim(buf_);
+        buf_.clear();
+        return s;
+    }
+
+private:
+    const std::vector<std::string> delimiters_ = {
+        u8"。", u8"！", u8"？"
+    };
+    static constexpr size_t min_sentence_len = 4;
+
+    // 前 3 句额外按逗号切分
+    static constexpr int kCommaSplitCount = 3;
+    int comma_left_ = kCommaSplitCount;
+
+    static std::string trim(const std::string& s) {
+        auto start = s.find_first_not_of(" \t\n\r");
+        if (start == std::string::npos) return "";
+        auto end = s.find_last_not_of(" \t\n\r");
+        return s.substr(start, end - start + 1);
+    }
+
+    std::string buf_;
+};
+
+// ============================================================================
+// 界面
+// ============================================================================
+
+namespace {
+
+void print_banner() {
+    std::cerr << "\n";
+    std::cerr << "╔════════════════════════════════╗\n";
+    std::cerr << "║  ASR → LLM → TTS  对话调度    ║\n";
+    std::cerr << "║  :v 语音输入 | 文字 文本输入  ║\n";
+    std::cerr << "║  exit 退出                    ║\n";
+    std::cerr << "╚════════════════════════════════╝\n\n";
+}
+
+bool is_exit_command(const std::string& s) {
+    std::string lower;
+    lower.reserve(s.size());
+    for (char c : s)
+        lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    auto start = lower.find_first_not_of(" \t\n\r");
+    auto end   = lower.find_last_not_of(" \t\n\r");
+    if (start == std::string::npos) return false;
+    auto t = lower.substr(start, end - start + 1);
+    return t == "exit" || t == "quit" || t == "bye";
+}
+
+/// 录音并返回识别文本
+std::string record_and_transcribe() {
+    std::string tmp_wav = "/tmp/asr_input_" + std::to_string(getpid()) + ".wav";
+
+    std::cerr << "🎤 录音中 (5秒)... " << std::flush;
+
+    std::ostringstream cmd;
+    cmd << "arecord -q -D " << MIC_DEVICE
+        << " -f S16_LE -r " << MIC_SAMPLE_RATE
+        << " -c 1 -d 5 " << tmp_wav
+        << " 2>/dev/null";
+    system(cmd.str().c_str());
+
+    std::cerr << "识别中..." << std::flush;
+    std::string text = asr_transcribe(tmp_wav);
+    std::remove(tmp_wav.c_str());
+    return text;
+}
+
+}  // namespace
+
+// ============================================================================
+// 统一流式 LLM → 标点切句 → TTS
+// ============================================================================
+
+/// 流式接收 LLM token，按 SentenceSplitter 的规则逐句提交给 TTS。
+/// on_delta 用于需要实时显示 token 的模式；返回完整回复供历史记录/UART 下发。
+static std::string stream_llm_to_tts(
+    const std::vector<Message>& messages,
+    const DeltaCallback& on_delta = {}) {
+    SentenceSplitter splitter;
+    std::string full_reply;
+
+    llm_chat_stream(messages, [&](const std::string& delta) {
+        full_reply += delta;
+        if (on_delta) on_delta(delta);
+
+        auto sentences = splitter.feed(delta);
+        for (auto& sentence : sentences) {
+            std::string clean = strip_emoji(strip_markdown(sentence));
+            if (!clean.empty()) tts_speak_async(clean);
+        }
+    });
+
+    // LLM 结束时，末尾没有句号的内容也必须送入 TTS。
+    std::string remaining = splitter.flush();
+    std::string clean = strip_emoji(strip_markdown(remaining));
+    if (!clean.empty()) tts_speak_async(clean);
+
+    return full_reply;
+}
+
+// ============================================================================
+// 设备控制意图 → 协议 TYPE 0x12 JSON
+// ============================================================================
+
+static bool contains_any(
+    const std::string& text,
+    std::initializer_list<std::string_view> keywords) {
+    for (const auto keyword : keywords) {
+        if (text.find(keyword) != std::string::npos) return true;
+    }
+    return false;
+}
+
+/// 仅映射明确、低歧义的设备控制指令；普通问答不产生 0x12。
+static std::optional<std::string> build_control_json(
+    const std::string& user_text) {
+    if (user_text.find(u8"呼吸机") != std::string::npos) {
+        if (contains_any(user_text, {u8"打开", u8"启动", u8"开机"})) {
+            return R"({"target":"呼吸机开关","action":"set","value":"启动"})";
+        }
+        if (contains_any(user_text, {u8"关闭", u8"停止", u8"关机"})) {
+            return R"({"target":"呼吸机开关","action":"set","value":"关闭"})";
+        }
+    }
+
+    if (contains_any(user_text, {u8"湿化器", u8"加湿器"})) {
+        if (contains_any(user_text, {u8"自动", u8"自动档"})) {
+            return R"({"target":"湿化器","action":"set","value":"自动"})";
+        }
+        if (contains_any(user_text, {u8"打开", u8"启动", u8"开启"})) {
+            return R"({"target":"湿化器","action":"set","value":"启动"})";
+        }
+        if (contains_any(user_text, {u8"关闭", u8"停止"})) {
+            return R"({"target":"湿化器","action":"set","value":"关闭"})";
+        }
+    }
+
+    if (user_text.find(u8"管路温度") != std::string::npos) {
+        std::smatch match;
+        if (std::regex_search(user_text, match, std::regex(R"((\d{1,2}))"))) {
+            const int temperature = std::stoi(match[1].str());
+            if (temperature >= 5 && temperature <= 40) {
+                return std::string(
+                           R"({"target":"管路温度","action":"set","value":)") +
+                       std::to_string(temperature) + "}";
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+static void uart_send_control_if_present(const std::string& user_text) {
+    auto control = build_control_json(user_text);
+    if (!control) return;
+    std::cerr << "[UART↓] 控制JSON: " << *control << std::endl;
+    uart_send_control(*control);
+}
+
+// ============================================================================
+// 交互式多轮对话
+// ============================================================================
+
+static int run_interactive() {
+    print_banner();
+    tts_init();
+
+    std::vector<Message> history;
+    int turn = 0;
+
+    while (true) {
+        ++turn;
+        std::cerr << "[" << turn << "] 你: " << std::flush;
+
+        std::string user_input;
+        std::getline(std::cin, user_input);
+
+        if (user_input.empty()) { --turn; continue; }
+        if (user_input == ":v") {
+            user_input = record_and_transcribe();
+            if (user_input.empty()) { --turn; continue; }
+            std::cerr << "识别: " << user_input << std::endl;
+        }
+        if (is_exit_command(user_input)) {
+            std::cerr << "再见！共对话 " << (turn - 1) << " 轮。" << std::endl;
+            break;
+        }
+
+        // 记录请求开始时间（首音延迟计时起点）
+        auto request_start = std::chrono::steady_clock::now();
+        tts_set_start_time(request_start);
+        history.push_back({"user", user_input});
+
+        std::string full_reply;
+
+        try {
+            full_reply = stream_llm_to_tts(history);
+        } catch (const std::exception& e) {
+            std::cerr << "\n[LLM 错误] " << e.what() << std::endl;
+        }
+
+        tts_wait_all();
+
+        std::cerr << full_reply << std::endl << std::endl;
+
+        if (!full_reply.empty())
+            history.push_back({"assistant", full_reply});
+        else
+            history.pop_back();
+    }
+
+    tts_cleanup();
+    return EXIT_SUCCESS;
+}
+
+// ============================================================================
+// 单发模式
+// ============================================================================
+
+static int run_once(const std::string& user_input) {
+    auto t0 = std::chrono::steady_clock::now();
+    tts_init();
+    tts_set_start_time(t0);
+
+    try {
+        std::string reply = stream_llm_to_tts(
+            {{"user", user_input}},
+            [](const std::string& delta) {
+                std::cout << delta << std::flush;
+            });
+        std::cout << std::endl;
+
+        if (reply.empty()) {
+            std::cerr << "[错误] LLM 返回空" << std::endl;
+            tts_cleanup();
+            return EXIT_FAILURE;
+        }
+
+        tts_cleanup();
+
+        return EXIT_SUCCESS;
+
+    } catch (const std::exception& e) {
+        tts_cleanup();
+        std::cerr << "[错误] " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+}
+
+// ============================================================================
+// 文件处理模式：音频文件 → ASR → LLM → TTS → MP3
+// ============================================================================
+
+static int run_file_mode(const std::string& input_file, const std::string& output_prefix) {
+    auto t_total  = std::chrono::steady_clock::now();
+    auto t_stage  = t_total;
+    long cvt_ms = 0, asr_ms = 0;
+
+    std::cerr << "音频文件 → ASR → LLM → TTS → MP3 (逐句)" << std::endl;
+
+    // 1. 转成 WAV
+    std::string wav_path = input_file;
+    if (input_file.find(".wav") == std::string::npos) {
+        wav_path = "/tmp/asr_input_" + std::to_string(getpid()) + ".wav";
+        std::ostringstream cmd;
+        cmd << "ffmpeg -y -i \"" << input_file
+            << "\" -ar 16000 -ac 1 -f wav " << wav_path << " 2>/dev/null";
+        if (system(cmd.str().c_str()) != 0) {
+            std::cerr << "❌ 音频转换失败" << std::endl;
+            return EXIT_FAILURE;
+        }
+        cvt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - t_stage).count();
+    }
+    t_stage = std::chrono::steady_clock::now();
+
+    // 2. ASR
+    std::string text = asr_transcribe(wav_path);
+    if (wav_path != input_file) std::remove(wav_path.c_str());
+    asr_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - t_stage).count();
+
+    if (text.empty()) {
+        std::cerr << "❌ ASR 识别为空" << std::endl;
+        return EXIT_FAILURE;
+    }
+    std::cerr << "  识别: " << text << std::endl;
+
+    // 3. LLM 流式 + 逐句 TTS → MP3
+    std::cerr << "  回复: " << std::flush;
+    auto t_llm_start = std::chrono::steady_clock::now();
+
+    SentenceSplitter splitter;
+    std::string full_reply;
+    int file_index = 0;
+    long first_mp3_ms = 0;
+    long first_tts_ms = 0;
+
+    std::vector<long> seg_times;
+    pid_t last_play_pid = -1;
+
+    llm_chat_stream({{"user", text}}, [&](const std::string& delta) {
+        std::cout << delta << std::flush;
+        full_reply += delta;
+        auto sentences = splitter.feed(delta);
+        for (auto& s : sentences) {
+            std::string clean = strip_emoji(strip_markdown(s));
+            if (clean.empty()) continue;
+
+            ++file_index;
+            std::string fname = (output_prefix.empty() ? "output" : output_prefix)
+                              + "_" + std::to_string(file_index) + ".mp3";
+            tts_to_file(clean, fname);
+            // 可选：通过开发板本机声卡播放；默认仅保存 MP3。
+            if (TTS_PLAY_AUDIO) {
+                if (last_play_pid > 0) {
+                    int status;
+                    waitpid(last_play_pid, &status, 0);
+                }
+                std::ostringstream pcmd;
+                pcmd << "ffmpeg -y -i \"" << fname << "\" -f wav - 2>/dev/null"
+                     << " | aplay -q -D " << AUDIO_DEVICE;
+                auto cmd_str = pcmd.str();
+                last_play_pid = fork();
+                if (last_play_pid == 0) {
+                    execlp("sh", "sh", "-c", cmd_str.c_str(), nullptr);
+                    _exit(1);
+                }
+            }
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t_total).count();
+            seg_times.push_back(ms);
+            if (!first_mp3_ms) first_mp3_ms = ms;
+        }
+    });
+    std::cout << std::endl;
+
+    // 剩余
+    auto remaining = splitter.flush();
+    std::string clean_remaining = strip_emoji(strip_markdown(remaining));
+    if (!clean_remaining.empty()) {
+        ++file_index;
+        std::string fname = (output_prefix.empty() ? "output" : output_prefix)
+                          + "_" + std::to_string(file_index) + ".mp3";
+        tts_to_file(clean_remaining, fname);
+    }
+
+    auto llm_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t_llm_start).count();
+    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t_total).count();
+
+    std::cerr << "\n═══════════════════════════════════" << std::endl;
+    std::cerr << "  耗时统计" << std::endl;
+    std::cerr << "───────────────────────────────────" << std::endl;
+    if (cvt_ms) std::cerr << "  音频转换:    " << cvt_ms << " ms" << std::endl;
+    std::cerr << "  ASR 识别:    " << asr_ms << " ms" << std::endl;
+    std::cerr << "  LLM+TTS 流式:" << llm_total_ms << " ms" << std::endl;
+    if (first_mp3_ms) std::cerr << "  ★ 首句 MP3:  " << first_mp3_ms << " ms (输入→第一个MP3完成)" << std::endl;
+    for (size_t i = 0; i < seg_times.size(); ++i) {
+        std::cerr << "     段" << (i + 1) << ":      " << seg_times[i] << " ms"
+                  << "  (" << (output_prefix.empty() ? "output" : output_prefix)
+                  << "_" << (i + 1) << ".mp3)" << std::endl;
+    }
+    std::cerr << "  ─────────────────────────────" << std::endl;
+    std::cerr << "  总耗时:      " << total_ms << " ms" << std::endl;
+    std::cerr << "  输出文件:    " << file_index << " 个 MP3" << std::endl;
+    std::cerr << "═══════════════════════════════════" << std::endl;
+
+    return EXIT_SUCCESS;
+}
+
+// ============================================================================
+// UART 串口模式：串口数据 → LLM → TTS
+// ============================================================================
+
+static int run_uart_mode(bool test_opus_only = false,
+                          const std::string& test_text = "",
+                          const std::string& test_mp3 = "") {
+    bool test_downlink = !test_text.empty() || !test_mp3.empty();
+    std::cerr << "UART 模式: " << UART_DEVICE << " " << UART_BAUD << " baud"
+              << (test_opus_only ? " [仅测试OPUS]" : "")
+              << (test_downlink ? " [下行测试]" : "") << std::endl;
+
+    UART uart(std::string(UART_DEVICE), UART_BAUD);
+    if (!uart.open()) {
+        std::cerr << "❌ 打开串口失败" << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    uart.start_receive();
+    uart.rx_buffer().clear();
+    uart_sender_set_fd(uart.fd());
+    std::cerr << "串口 RX 线程已启动, 等待数据..." << std::endl;
+
+    // -- 下行测试模式 --
+    if (test_downlink) {
+        std::cerr << "\n===== UART 下行测试 =====\n" << std::endl;
+        sleep(1);
+
+        if (!test_text.empty()) {
+            std::ifstream f(test_text);
+            if (f) {
+                std::string content((std::istreambuf_iterator<char>(f)),
+                                     std::istreambuf_iterator<char>());
+                std::cerr << "发送文本(" << content.size() << "B): " << content << std::endl;
+                for (int i = 0; i < 3; ++i) {  // 发 3 遍方便测试
+                    uart_send_segment_text(content);
+                    sleep(1);
+                }
+            } else {
+                std::cerr << "无法打开: " << test_text << std::endl;
+            }
+        }
+
+        if (!test_mp3.empty()) {
+            std::ifstream f(test_mp3, std::ios::binary);
+            if (f) {
+                std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),
+                                           std::istreambuf_iterator<char>());
+                std::cerr << "发送MP3(" << data.size() << "B)" << std::endl;
+                uart_send_mp3(data);
+            } else {
+                std::cerr << "无法打开: " << test_mp3 << std::endl;
+            }
+        }
+
+        std::cerr << "===== 下行测试结束 =====\n" << std::endl;
+    }
+
+    if (!test_opus_only) {
+        tts_init();
+        tts_set_segment_ready_callback(
+            [](const std::string& text, const std::string& mp3_path) {
+                // 协议 6.4/6.5：每段先发对应文本 0x13，再发 MP3 0x11。
+                uart_send_segment_text(text);
+
+                std::ifstream file(mp3_path, std::ios::binary);
+                if (!file) {
+                    std::cerr << "[UART↓] 无法打开 TTS MP3: "
+                              << mp3_path << std::endl;
+                    return;
+                }
+                std::vector<uint8_t> mp3(
+                    (std::istreambuf_iterator<char>(file)),
+                    std::istreambuf_iterator<char>());
+                if (mp3.empty()) {
+                    std::cerr << "[UART↓] TTS MP3 为空: "
+                              << mp3_path << std::endl;
+                    return;
+                }
+                uart_send_mp3(mp3);
+            });
+    }
+
+    Parser parser(uart.rx_buffer(), uart);
+    OpusAccumulator opus_acc;
+    std::optional<std::chrono::steady_clock::time_point> uart_audio_start;
+
+    opus_acc.set_decode_callback([&](const std::string& wav_path,
+                                      const std::string& info) {
+        const auto request_start =
+            uart_audio_start.value_or(std::chrono::steady_clock::now());
+        uart_audio_start.reset();
+
+        std::cerr << "\n[OPUS→WAV] " << info << std::endl;
+        std::cerr << "  WAV: " << wav_path << std::endl;
+
+        if (test_opus_only) {
+            std::cerr << "  [测试模式] 播放: aplay -D " << AUDIO_DEVICE
+                      << " " << wav_path << std::endl;
+            return;
+        }
+
+        // ASR → LLM → TTS
+        try {
+            std::string text = asr_transcribe(wav_path);
+            if (text.empty()) return;
+            std::cerr << "  ASR: " << text << std::endl;
+            const auto asr_latency_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - request_start)
+                    .count();
+            std::cerr << "[延迟] UART音频首帧→ASR完成: "
+                      << asr_latency_ms << " ms" << std::endl;
+
+            tts_set_start_time(request_start);
+            std::string reply = stream_llm_to_tts(
+                {{"user", text}},
+                [](const std::string& delta) {
+                    std::cerr << delta << std::flush;
+                });
+            if (reply.empty()) return;
+            std::cerr << std::endl;
+            tts_wait_all();
+            uart_send_control_if_present(text);
+        } catch (const std::exception& e) {
+            std::cerr << "  [错误] " << e.what() << std::endl;
+        }
+    });
+
+    parser.set_frame_callback([&](const DataFrame& frame) {
+        if (!frame.checksum_ok) return;
+
+        if (frame.type == 0x01) {
+            // 音频帧 → OPUS 累积
+            // STATE=1 表示新唤醒；否则本轮第一个 0x01 帧作为计时起点。
+            if (frame.status == 1 || !uart_audio_start.has_value()) {
+                uart_audio_start = std::chrono::steady_clock::now();
+                std::cerr << "[延迟] 收到本轮 UART 音频首帧"
+                          << " (STATE=" << static_cast<int>(frame.status)
+                          << ")" << std::endl;
+            }
+            opus_acc.feed(frame.data, frame.status, frame.slice, frame.seq);
+        } else if (frame.type >= 0x02 && frame.type <= 0x04) {
+            // 文本帧 (JSON/UTF-8) → 直接送 LLM
+            std::string text(frame.data.begin(), frame.data.end());
+            std::cerr << "\n[UART TYPE=0x" << std::hex << (int)frame.type << std::dec
+                      << "] " << text << std::endl;
+
+            if (!test_opus_only) {
+                try {
+                    std::cerr << "  [AI] 处理中..." << std::endl;
+                    tts_set_start_time(std::chrono::steady_clock::now());
+                    std::string reply = stream_llm_to_tts(
+                        {{"user", text}},
+                        [](const std::string& delta) {
+                            std::cerr << delta << std::flush;
+                        });
+                    std::cerr << std::endl;
+                    tts_wait_all();
+                    uart_send_control_if_present(text);
+                } catch (const std::exception& e) {
+                    std::cerr << "  [错误] " << e.what() << std::endl;
+                }
+            }
+        } else {
+            // 下行帧或其他
+            std::string text(frame.data.begin(), frame.data.end());
+            std::cerr << "[UART TYPE=0x" << std::hex << (int)frame.type << std::dec
+                      << "] " << text << std::endl;
+        }
+    });
+
+    // 主循环：30ms 轮询
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        parser.process();
+    }
+
+    return EXIT_SUCCESS;
+}
+
+// ============================================================================
+// 入口
+// ============================================================================
+
+int main(int argc, char* argv[]) {
+    // TTS 测试: ./audio_pipeline --test-tts [text]
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--test-tts") == 0) {
+            std::string text = (i + 1 < argc) ? argv[i + 1] : "你好，TTS测试。";
+            std::string out  = (i + 2 < argc) ? argv[i + 2] : "/home/yu/workspace/tts_test.mp3";
+            std::cerr << "TTS 测试: " << text << " → " << out << std::endl;
+            tts_to_file(strip_emoji(strip_markdown(text)), out);
+            std::cerr << "完成: " << out << std::endl;
+            return 0;
+        }
+    }
+
+    // UART 模式: ./audio_pipeline -u [--test-opus] [--test-downlink text.txt mp3.mp3]
+    bool uart_mode = false, test_opus = false;
+    std::string downlink_text, downlink_mp3;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--uart") == 0)
+            uart_mode = true;
+        if (strcmp(argv[i], "--test-opus") == 0)
+            test_opus = true;
+        if (strcmp(argv[i], "--test-downlink") == 0 && i + 2 < argc) {
+            downlink_text = argv[i + 1];
+            downlink_mp3  = argv[i + 2];
+            i += 2;
+        }
+    }
+    if (uart_mode) return run_uart_mode(test_opus, downlink_text, downlink_mp3);
+
+    // 文件模式: ./audio_pipeline -f input.opus -o output.mp3
+    std::string file_input, file_output;
+    for (int i = 1; i < argc; ++i) {
+        if ((strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) && i + 1 < argc)
+            file_input = argv[++i];
+        else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc)
+            file_output = argv[++i];
+    }
+    if (!file_input.empty())
+        return run_file_mode(file_input, file_output.empty() ? "output.mp3" : file_output);
+
+    if (argc >= 2) {
+        std::string input;
+        for (int i = 1; i < argc; ++i) {
+            if (i > 1) input += " ";
+            input += argv[i];
+        }
+        return run_once(input);
+    }
+    return run_interactive();
+}
